@@ -1,8 +1,8 @@
 using Enzyme, KomaMRI, KomaMRIPlots, Optim, Reactant
 using LinearAlgebra: dot, norm
 using MRICoilSensitivities: espirit
-Reactant.set_default_backend("cpu")
-Reactant.allowscalar(false)
+Reactant.set_default_backend("gpu")
+Reactant.allowscalar(true)
 
 centered_axis(width, count) =
     Float32.(range(-width / 2 + width / (2count); step=width / count, length=count))
@@ -106,7 +106,7 @@ function loss_gradient(θ, p)
     result.val, result.derivs[1]
 end
 
-function check_gradient(evaluate, θ, n; offset=1e-1, h=1e-3, tolerance=1e-2)
+function check_gradient(evaluate, θ, n; offset=1e-1, h=1e-2, tolerance=1e-2)
     direction() = vcat(norm(θ[1:n]) / sqrt(n) .* randn(n), randn(2))
     θ = θ .+ offset .* direction()
     v = h .* direction()
@@ -119,20 +119,12 @@ function check_gradient(evaluate, θ, n; offset=1e-1, h=1e-3, tolerance=1e-2)
     relative < tolerance || error("AD gradient check failed: $relative")
 end
 
-function run_final_ad(;
-    image_size=(128, 128),
-    warmup=10,
-    iterations=80,
-    data_directory=isempty(ARGS) ?
-        joinpath(homedir(), "Desktop/Data/cleaner brain data acq 21 august") : first(ARGS),
-    output_directory=joinpath(@__DIR__, "FINAL_AD")
-)
+function reconstruct(p, image_size; warmup, iterations, output_directory)
     mkpath(output_directory)
-    p = load_problem(data_directory, image_size)
     n = 2prod(image_size)
     device(θ) = Reactant.to_rarray(Float32.(θ))
     θ = zeros(n + 2)
-    gradient = Reactant.@allowscalar Reactant.compile(loss_gradient, (device(θ), p); sync=true)
+    gradient = Reactant.compile(loss_gradient, (device(θ), p); sync=true)
     relaxation_fixed = Ref(true)
     function evaluate(F, G, θ)
         value, ∇ = gradient(device(θ), p)
@@ -167,7 +159,18 @@ function run_final_ad(;
     write(joinpath(output_directory, "loss.csv"), join(rows, '\n') * "\n")
     write(joinpath(output_directory, "optim.txt"), sprint(show, result))
     θ = Optim.minimizer(result)
-    complex.(θ[1:n÷2], θ[n÷2+1:n])
+    complex.(θ[1:n÷2], θ[n÷2+1:n]), exp(θ[n+1]), exp(θ[n+2])
+end
+
+function run_final_ad(;
+    image_size=(128, 128),
+    warmup=5,
+    iterations=100,
+    data_directory=isempty(ARGS) ?
+        joinpath(homedir(), "Desktop/Data/cleaner brain data acq 21 august") : first(ARGS),
+    output_directory=joinpath(@__DIR__, "FINAL_AD")
+)
+    reconstruct(load_problem(data_directory, image_size), image_size; warmup, iterations, output_directory)
 end
 
 abspath(PROGRAM_FILE) == (@__FILE__) && run_final_ad()
