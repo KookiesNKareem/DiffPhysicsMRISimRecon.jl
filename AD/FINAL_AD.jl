@@ -119,26 +119,19 @@ function check_gradient(evaluate, θ, n; offset=1e-1, h=1e-2, tolerance=1e-2)
     relative < tolerance || error("AD gradient check failed: $relative")
 end
 
-function reconstruct(p, image_size; warmup, iterations, output_directory)
+function reconstruct(p, image_size; iterations, output_directory)
     mkpath(output_directory)
     n = 2prod(image_size)
     device(θ) = Reactant.to_rarray(Float32.(θ))
     θ = zeros(n + 2)
     gradient = Reactant.compile(loss_gradient, (device(θ), p); sync=true)
-    relaxation_fixed = Ref(true)
     function evaluate(F, G, θ)
         value, ∇ = gradient(device(θ), p)
-        if G !== nothing
-            copyto!(G, Array(∇))
-            relaxation_fixed[] && (G[n+1:end] .= 0)
-        end
+        G === nothing || copyto!(G, Array(∇))
         F === nothing ? nothing : Float64(Reactant.to_number(value))
     end
     rows = ["iteration,loss,T1,T2"]
-    previous = fill(NaN, n + 2)
     function record(state)
-        state.x == previous && return false
-        copyto!(previous, state.x)
         iteration = length(rows) - 1
         t1, t2 = exp(state.x[n+1]), exp(state.x[n+2])
         push!(rows, "$iteration,$(state.f_x),$t1,$t2")
@@ -150,27 +143,28 @@ function reconstruct(p, image_size; warmup, iterations, output_directory)
         println("iteration=$iteration loss=$(state.f_x) T1=$t1 T2=$t2")
         false
     end
-    objective = Optim.NLSolversBase.only_fg!(evaluate)
-    density = optimize(objective, θ, LBFGS(m=10), Optim.Options(; iterations=warmup, callback=record))
-    relaxation_fixed[] = false
-    check_gradient(evaluate, Optim.minimizer(density), n)
-    result = optimize(objective, Optim.minimizer(density), LBFGS(m=10), Optim.Options(; iterations, callback=record))
+    result = optimize(
+        Optim.NLSolversBase.only_fg!(evaluate),
+        θ,
+        LBFGS(m=10),
+        Optim.Options(; iterations, callback=record)
+    )
     println(result)
     write(joinpath(output_directory, "loss.csv"), join(rows, '\n') * "\n")
     write(joinpath(output_directory, "optim.txt"), sprint(show, result))
     θ = Optim.minimizer(result)
+    check_gradient(evaluate, θ, n)
     complex.(θ[1:n÷2], θ[n÷2+1:n]), exp(θ[n+1]), exp(θ[n+2])
 end
 
 function run_final_ad(;
     image_size=(128, 128),
-    warmup=5,
     iterations=100,
     data_directory=isempty(ARGS) ?
         joinpath(homedir(), "Desktop/Data/cleaner brain data acq 21 august") : first(ARGS),
     output_directory=joinpath(@__DIR__, "FINAL_AD")
 )
-    reconstruct(load_problem(data_directory, image_size), image_size; warmup, iterations, output_directory)
+    reconstruct(load_problem(data_directory, image_size), image_size; iterations, output_directory)
 end
 
 abspath(PROGRAM_FILE) == (@__FILE__) && run_final_ad()
