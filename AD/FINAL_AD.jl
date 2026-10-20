@@ -48,7 +48,7 @@ function estimate_coils(path, measured, x, y; floor=1f-2, regularization=1f-4)
     intensity .* values ./ max.(rss, floor * maximum(rss))
 end
 
-function load_problem(data_directory, image_size)
+function load_problem(data_directory, image_size, T1, T2)
     measured_path = joinpath(data_directory, "brain_gre_3t_acc/meas_MID00492_FID42184_bssfp_optimized_2x.mrd")
     adjustment_path = joinpath(data_directory, "brain_gre_3t_acc/meas_MID00478_FID42170_AdjCoilSens.mrd")
     sequence_path = joinpath(data_directory, "bssfp_slice_all_adc_optimized_R2.seq")
@@ -68,8 +68,8 @@ function load_problem(data_directory, image_size)
         y=vcat(y, y),
         z=vcat(z, z),
         ρ=ones(Float32, 2length(x)),
-        T1=ones(Float32, 2length(x)),
-        T2=ones(Float32, 2length(x)),
+        T1=fill(Float32(T1), 2length(x)),
+        T2=fill(Float32(T2), 2length(x)),
         T2s=ones(Float32, 2length(x))
     )
     receiver = vcat(coils, ComplexF32(0, 1) .* coils)
@@ -87,33 +87,32 @@ function load_problem(data_directory, image_size)
         scanner,
         sim,
         b=Reactant.to_rarray(target),
-        scale=sum(abs2, target)
+        scale=sum(abs2, target),
+        T1,
+        T2
     )
 end
 
-function A(θ, p)
-    n = length(θ) - 2
+function A(ρ, p)
     object = copy(p.object)
-    object.ρ .= θ[1:n]
-    object.T1 .= exp.(θ[n+1:n+1])
-    object.T2 .= exp.(θ[n+2:n+2])
+    object.ρ .= ρ
     simulate(object, p.sequence, p.scanner; sim_params=p.sim, verbose=false)[:, :, 1]
 end
 
-loss(θ, p) = sum(abs2, A(θ, p) - p.b) / p.scale
-function loss_gradient(θ, p)
-    result = Enzyme.gradient(Enzyme.ReverseWithPrimal, loss, θ, Enzyme.Const(p))
+loss(ρ, p) = sum(abs2, A(ρ, p) - p.b) / p.scale
+function loss_gradient(ρ, p)
+    result = Enzyme.gradient(Enzyme.ReverseWithPrimal, loss, ρ, Enzyme.Const(p))
     result.val, result.derivs[1]
 end
 
-function check_gradient(evaluate, θ, n; offset=1e-1, h=1e-2, tolerance=1e-2)
-    direction() = vcat(norm(θ[1:n]) / sqrt(n) .* randn(n), randn(2))
-    θ = θ .+ offset .* direction()
+function check_gradient(evaluate, ρ; offset=1e-1, h=1e-2, tolerance=1e-2)
+    direction() = norm(ρ) / sqrt(length(ρ)) .* randn(length(ρ))
+    ρ = ρ .+ offset .* direction()
     v = h .* direction()
-    G = similar(θ)
-    evaluate(nothing, G, θ)
+    G = similar(ρ)
+    evaluate(nothing, G, ρ)
     analytic = dot(G, v)
-    numeric = (evaluate(0.0, nothing, θ .+ v) - evaluate(0.0, nothing, θ .- v)) / 2
+    numeric = (evaluate(0.0, nothing, ρ .+ v) - evaluate(0.0, nothing, ρ .- v)) / 2
     relative = abs(analytic - numeric) / max(abs(numeric), eps())
     println("gradient check: analytic=$analytic numeric=$numeric relative_error=$relative")
     relative < tolerance || error("AD gradient check failed: $relative")
@@ -122,49 +121,50 @@ end
 function reconstruct(p, image_size; iterations, output_directory)
     mkpath(output_directory)
     n = 2prod(image_size)
-    device(θ) = Reactant.to_rarray(Float32.(θ))
-    θ = zeros(n + 2)
-    gradient = Reactant.compile(loss_gradient, (device(θ), p); sync=true)
-    function evaluate(F, G, θ)
-        value, ∇ = gradient(device(θ), p)
+    device(ρ) = Reactant.to_rarray(Float32.(ρ))
+    ρ = zeros(n)
+    gradient = Reactant.compile(loss_gradient, (device(ρ), p); sync=true)
+    function evaluate(F, G, ρ)
+        value, ∇ = gradient(device(ρ), p)
         G === nothing || copyto!(G, Array(∇))
         F === nothing ? nothing : Float64(Reactant.to_number(value))
     end
     rows = ["iteration,loss,T1,T2"]
     function record(state)
         iteration = length(rows) - 1
-        t1, t2 = exp(state.x[n+1]), exp(state.x[n+2])
-        push!(rows, "$iteration,$(state.f_x),$t1,$t2")
+        push!(rows, "$iteration,$(state.f_x),$(p.T1),$(p.T2)")
         image = reverse(reshape(abs.(complex.(state.x[1:n÷2], state.x[n÷2+1:n])), image_size); dims=1)
         savefig(
             plot_image(image; title="AD iteration $iteration"),
             joinpath(output_directory, "iteration_$(lpad(iteration, 2, '0')).png")
         )
-        println("iteration=$iteration loss=$(state.f_x) T1=$t1 T2=$t2")
+        println("iteration=$iteration loss=$(state.f_x)")
         false
     end
     result = optimize(
         Optim.NLSolversBase.only_fg!(evaluate),
-        θ,
+        ρ,
         LBFGS(m=10),
         Optim.Options(; iterations, callback=record)
     )
     println(result)
     write(joinpath(output_directory, "loss.csv"), join(rows, '\n') * "\n")
     write(joinpath(output_directory, "optim.txt"), sprint(show, result))
-    θ = Optim.minimizer(result)
-    check_gradient(evaluate, θ, n)
-    complex.(θ[1:n÷2], θ[n÷2+1:n]), exp(θ[n+1]), exp(θ[n+2])
+    ρ = Optim.minimizer(result)
+    check_gradient(evaluate, ρ)
+    complex.(ρ[1:n÷2], ρ[n÷2+1:n])
 end
 
 function run_final_ad(;
     image_size=(128, 128),
     iterations=100,
+    T1=1f0,
+    T2=1f0,
     data_directory=isempty(ARGS) ?
         joinpath(homedir(), "Desktop/Data/cleaner brain data acq 21 august") : first(ARGS),
     output_directory=joinpath(@__DIR__, "FINAL_AD")
 )
-    reconstruct(load_problem(data_directory, image_size), image_size; iterations, output_directory)
+    reconstruct(load_problem(data_directory, image_size, T1, T2), image_size; iterations, output_directory)
 end
 
 abspath(PROGRAM_FILE) == (@__FILE__) && run_final_ad()
